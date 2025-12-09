@@ -1,2 +1,0 @@
-
-constructor=name,org,gvc,agentWorkload,labels,useUniqueAgents,allowJobsWithoutLabels,executors,cpu,memory,retentionMins,agentImage,volumeSetName,volumeSetPath,identity,jenkinsControllerUrl,apiKey

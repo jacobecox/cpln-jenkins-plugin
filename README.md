@@ -14,7 +14,7 @@ and unprovisioning of resources based on physical load.
 ### Build
 
 #### Get the repository:
-```git clone https://github.com/user467279/cpln-jenkins-plugin.git```
+```git clone git@github.com:controlplane-com/cpln-jenkins-plugin.git```
 
 #### Install maven (latest or recent recommended with java v21 installed)
 https://maven.apache.org/download.cgi
@@ -166,7 +166,7 @@ interested in leveraging Control Plane services, time and resources will need to
 
 ## Contributing
 
-Zsolt Szabadi zsoltszabadi@hotmail.com
+
 
 ## LICENSE
 
