@@ -1,0 +1,4 @@
+<?jelly escape-by-default='true'?>
+<div>
+    This plugin provides Jenkins agent provisioning on <a href="https://controlplane.com">Control Plane</a>
+</div>

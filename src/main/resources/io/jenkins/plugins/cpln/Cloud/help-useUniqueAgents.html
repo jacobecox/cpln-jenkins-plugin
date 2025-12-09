@@ -1,0 +1,24 @@
+<div>
+    Check if you want the plugin to create unique / dedicated agent workloads for each (or a small number) of job items instead of
+    handling a larger set of job items with a specific cloud configuration. If checked, the plugin allows Jenkins to provision one
+    agent for each job item, so they can be processed concurrently regardless of how many concurrent jobs are allowed on
+    each agent. The # of executors setting for the cloud configuration still works the same way but new agents are allowed to
+    be provisioned based on load. If a unique agent is always meant to process a single job item at a time, set the # of executors
+    on the corresponding cloud configuration to 1. Note that Jenkins provisioning continuously evaluates different load factors
+    based on moving averages of available or not-yet-available executors, job queue length etc. Some over-provisioning of agents
+    may be expected on job burst, very short job executions, substantial agent startup delays etc. Unused agents will be unprovisioned
+    based on the configured idle timeout and so, removed from both Jenkins and Control Plane GVC locations. If available / allowed
+    cloud capacity falls short, new agents that failed provisioning will be removed from Jenkins and queued jobs will be processed as
+    new / additional cloud capacity becomes available.
+
+    It is recommended that you consult the Jenkins parameters MARGIN, MARGIN0 and MARGIN_DECAY, which can help fine tune Jenkins
+    resource provisioning scenarios.
+
+    <p>
+        With a not too aggressive provisioning strategy, the below values may be considered:
+    </p>
+
+    <p>
+        <code>... -Dhudson.slaves.NodeProvisioner.MARGIN=50 -Dhudson.slaves.NodeProvisioner.MARGIN0=0.85 -Dhudson.slaves.NodeProvisioner.MARGIN_DECAY=0.3 ...</code>
+    </p>
+</div>

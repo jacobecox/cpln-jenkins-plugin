@@ -1,0 +1,94 @@
+{
+  "kind": "workload",
+  "name": "<<CPLN-AGENT-NAME>>",
+  "description": "<<CPLN-AGENT-DESC>>",
+  "tags": {},
+  "gvc": "<<CPLN-GVC-NAME>>",
+  "spec": {
+    "type": "standard",
+    "containers": [
+      {
+        "name": "inbound-agent",
+        "cpu": "<<CPLN-AGENT-CONTAINER-CPU>>m",
+        "env": [
+          {
+            "name": "JENKINS_AGENT_NAME",
+            "value": "<<JENKINS-AGENT-NAME>>"
+          },
+          {
+            "name": "JENKINS_SECRET",
+            "value": "<<JENKINS-AGENT-SECRET>>"
+          },
+          {
+            "name": "JENKINS_URL",
+            "value": "<<JENKINS-CONTROLLER-URL>>"
+          },
+          {
+            "name": "JENKINS_WEB_SOCKET",
+            "value": "true"
+          }
+        ],
+        "image": "<<JENKINS-AGENT-IMAGE>>",
+        "inheritEnv": false,
+        "memory": "<<CPLN-AGENT-CONTAINER-MEMORY>>Mi",
+        "ports": [
+          {
+            "number": 8080,
+            "protocol": "http"
+          }
+        ],
+        "volumes": [
+          {
+            "path": "<<CPLN-VOLUMESET-PATH>>",
+            "uri": "cpln://volumeset/<<CPLN-VOLUMESET-NAME>>"
+          }
+        ]
+      }
+    ],
+    "defaultOptions": {
+      "autoscaling": {
+        "keda": {
+          "cooldownPeriod": 1,
+          "initialCooldownPeriod": 1,
+          "pollingInterval": 1,
+          "triggers": []
+        },
+        "maxConcurrency": 0,
+        "maxScale": 1,
+        "metric": "cpu",
+        "minScale": 1,
+        "scaleToZeroDelay": 300,
+        "target": 100
+      },
+      "capacityAI": false,
+      "debug": false,
+      "suspend": false,
+      "timeoutSeconds": 20
+    },
+    "firewallConfig": {
+      "external": {
+        "inboundAllowCIDR": [],
+        "inboundBlockedCIDR": [],
+        "outboundAllowCIDR": [
+          "0.0.0.0/0"
+        ],
+        "outboundAllowHostname": [],
+        "outboundAllowPort": [],
+        "outboundBlockedCIDR": []
+      },
+      "internal": {
+        "inboundAllowType": "none",
+        "inboundAllowWorkload": []
+      }
+    },
+    <<CPLN-IDENTITY-LINK>>
+    "loadBalancer": {
+      "direct": {
+        "enabled": false,
+        "ports": []
+      },
+      "replicaDirect": false
+    },
+    "supportDynamicTags": false
+  }
+}
