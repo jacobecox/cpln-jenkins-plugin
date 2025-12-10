@@ -3,20 +3,27 @@
         Specify the CPU resources in millicores (m) for the Jenkins agent container.
     </p>
     <p>
-        <strong>Minimum:</strong> 25 millicores (CPLN platform minimum)
+        <strong>Minimum:</strong> 50 millicores (required for Jenkins agent to start)
+    </p>
+    <p>
+        <strong>Recommended:</strong> 200 millicores or higher
     </p>
     <p>
         <strong>Default:</strong> 200 millicores
     </p>
     <p>
-        <strong>Note:</strong> Do not exceed your CPLN organization's CPU quota. 
-        Check your quota in the Control Plane console under Org settings.
+        <strong>Important:</strong> The Jenkins inbound-agent is a Java process that requires 
+        adequate CPU to start. Values below 50m will likely cause the agent to fail to start.
+        Values below 200m may cause slow startup or poor performance.
+    </p>
+    <p>
+        <strong>Note:</strong> Do not exceed your CPLN organization's CPU quota.
     </p>
     <p>
         Examples:
         <ul>
-            <li>25m = minimum for basic workloads</li>
-            <li>200m = good for light Jenkins agents</li>
+            <li>50m = absolute minimum (not recommended)</li>
+            <li>200m = recommended for light Jenkins agents</li>
             <li>500m = recommended for moderate build workloads</li>
             <li>1000m = 1 full CPU core for heavy builds</li>
         </ul>

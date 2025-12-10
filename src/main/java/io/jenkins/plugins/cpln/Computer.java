@@ -18,6 +18,9 @@ import static java.util.logging.Level.*;
  * This class extends AbstractCloudComputer and adds CPLN-specific cleanup logic
  * that is independent from the remoting lifecycle. It ensures workload cleanup
  * happens regardless of how the agent connection terminates.
+ * 
+ * Also tracks activity time for stuck agent detection - this helps identify
+ * agents that appear online but have a stalled JVM.
  */
 @SuppressFBWarnings
 public class Computer extends AbstractCloudComputer<Agent> {
@@ -29,9 +32,15 @@ public class Computer extends AbstractCloudComputer<Agent> {
     
     // Track if cleanup has been triggered
     private volatile boolean cleanupTriggered = false;
+    
+    // Track last activity time for stuck agent detection
+    // This is updated when meaningful channel activity occurs
+    private volatile long lastActivityTime = 0;
 
     public Computer(Agent slave) {
         super(slave);
+        // Initialize activity time when computer is created
+        this.lastActivityTime = System.currentTimeMillis();
     }
 
     /**
@@ -41,6 +50,8 @@ public class Computer extends AbstractCloudComputer<Agent> {
     public void setWorkloadProvisioned(boolean provisioned) {
         this.workloadProvisioned = provisioned;
         if (provisioned) {
+            // Record activity when workload is provisioned
+            recordActivity();
             Agent agent = getNode();
             if (agent != null && agent.getCloud() != null) {
                 WorkloadReconciler.trackWorkload(getName(), agent.getCloud().name, null);
@@ -142,6 +153,29 @@ public class Computer extends AbstractCloudComputer<Agent> {
      */
     public void resetCleanupState() {
         cleanupTriggered = false;
+    }
+
+    /**
+     * Record that meaningful activity has occurred on this agent.
+     * This resets the stuck agent detection timer.
+     * 
+     * Called when:
+     * - Agent connects/reconnects
+     * - Build starts executing
+     * - Channel receives meaningful communication
+     */
+    public void recordActivity() {
+        this.lastActivityTime = System.currentTimeMillis();
+        LOGGER.log(FINE, "Activity recorded for computer {0}", getName());
+    }
+
+    /**
+     * Get the last activity time for stuck agent detection.
+     * 
+     * @return timestamp of last activity, or 0 if never recorded
+     */
+    public long getLastActivityTime() {
+        return lastActivityTime;
     }
 
     /**

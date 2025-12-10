@@ -30,9 +30,14 @@ public class Utils {
     private static final String DEFAULT_AGENT_SPEC = "specs/default-agent-spec.json";
     private static final String DEFAULT_AGENT_SPEC_WITH_VOLUMES = "specs/default-agent-spec-with-volumes.json";
     
-    // CPU and Memory minimums
-    public static final int MIN_CPU_MILLICORES = 25;
-    public static final int MIN_MEMORY_MEBIBYTES = 32;
+    // CPU and Memory minimums - realistic values for Jenkins inbound-agent (Java process)
+    // The CPLN platform allows lower values, but the Jenkins agent won't start properly
+    public static final int MIN_CPU_MILLICORES = 50;
+    public static final int MIN_MEMORY_MEBIBYTES = 128;
+    
+    // Recommended values - below these, the agent may start but run poorly or OOM
+    public static final int RECOMMENDED_CPU_MILLICORES = 200;
+    public static final int RECOMMENDED_MEMORY_MEBIBYTES = 256;
 
     private static final HttpClient httpClient = HttpClient.newBuilder()
             .connectTimeout(Duration.ofSeconds(30))

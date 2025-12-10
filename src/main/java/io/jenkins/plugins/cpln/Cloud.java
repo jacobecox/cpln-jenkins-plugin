@@ -775,8 +775,13 @@ public class Cloud extends hudson.slaves.Cloud {
         public FormValidation doCheckCpu(@QueryParameter int cpu) {
             if (cpu < Utils.MIN_CPU_MILLICORES) {
                 return FormValidation
-                        .error(String.format("The CPU millicores must be at least %d (minimum for CPLN), found %d", 
+                        .error(String.format("CPU must be at least %dm for the Jenkins agent to start. Found: %dm", 
                                 Utils.MIN_CPU_MILLICORES, cpu));
+            }
+            if (cpu < Utils.RECOMMENDED_CPU_MILLICORES) {
+                return FormValidation
+                        .warning(String.format("CPU below %dm may cause slow agent startup or failures. Recommended: %dm or higher.", 
+                                Utils.RECOMMENDED_CPU_MILLICORES, Utils.RECOMMENDED_CPU_MILLICORES));
             }
             return FormValidation.ok();
         }
@@ -784,8 +789,13 @@ public class Cloud extends hudson.slaves.Cloud {
         public FormValidation doCheckMemory(@QueryParameter int memory) {
             if (memory < Utils.MIN_MEMORY_MEBIBYTES) {
                 return FormValidation
-                        .error(String.format("The Memory mebibytes must be at least %d (minimum for CPLN), found %d", 
+                        .error(String.format("Memory must be at least %dMi for the Jenkins agent to start. Found: %dMi", 
                                 Utils.MIN_MEMORY_MEBIBYTES, memory));
+            }
+            if (memory < Utils.RECOMMENDED_MEMORY_MEBIBYTES) {
+                return FormValidation
+                        .warning(String.format("Memory below %dMi may cause agent OOM or startup failures. Recommended: %dMi or higher.", 
+                                Utils.RECOMMENDED_MEMORY_MEBIBYTES, Utils.RECOMMENDED_MEMORY_MEBIBYTES));
             }
             return FormValidation.ok();
         }

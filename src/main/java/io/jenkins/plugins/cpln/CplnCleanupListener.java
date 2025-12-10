@@ -79,6 +79,10 @@ public class CplnCleanupListener extends ComputerListener {
         // Cancel any pending cleanup since the agent came online
         pendingCleanups.remove(workloadName);
         
+        // Record activity for stuck agent detection
+        // Agent just came online, so it's clearly not stuck
+        computer.recordActivity();
+        
         // Clear the provisioning cooldown so new agents can be provisioned for other jobs
         Cloud.clearProvisioningCooldown(cloud.name, agent.getLabelString());
         
