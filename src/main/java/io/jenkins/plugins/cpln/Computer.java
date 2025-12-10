@@ -4,8 +4,9 @@ import edu.umd.cs.findbugs.annotations.CheckForNull;
 import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import hudson.slaves.AbstractCloudComputer;
 import hudson.slaves.OfflineCause;
+import org.kohsuke.stapler.HttpResponse;
+import org.kohsuke.stapler.HttpResponses;
 
-import java.io.IOException;
 import java.util.concurrent.Future;
 import java.util.logging.Logger;
 
@@ -77,12 +78,18 @@ public class Computer extends AbstractCloudComputer<Agent> {
      * Override doDoDelete to ensure cleanup is triggered when node is manually deleted.
      */
     @Override
-    public void doDoDelete() throws IOException {
+    public HttpResponse doDoDelete() {
         LOGGER.log(INFO, "CPLN Computer {0} being deleted", getName());
         
         triggerCleanup("manual deletion");
         
-        super.doDoDelete();
+        try {
+            return super.doDoDelete();
+        } catch (java.io.IOException e) {
+            LOGGER.log(WARNING, "Error during doDoDelete for {0}: {1}", 
+                    new Object[]{getName(), e.getMessage()});
+            throw HttpResponses.error(500, e);
+        }
     }
 
     /**
