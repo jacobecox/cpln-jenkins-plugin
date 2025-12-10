@@ -3,6 +3,7 @@ package io.jenkins.plugins.cpln;
 import static io.jenkins.plugins.cpln.Utils.*;
 import static java.util.logging.Level.INFO;
 import static java.util.logging.Level.WARNING;
+import static java.util.logging.Level.FINE;
 
 import com.google.common.base.Strings;
 import edu.umd.cs.findbugs.annotations.NonNull;
@@ -22,8 +23,10 @@ import io.jenkins.plugins.cpln.model.*;
 import java.io.IOException;
 import java.io.StringReader;
 import java.net.http.HttpResponse;
+import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.logging.Logger;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
@@ -58,6 +61,10 @@ public class Cloud extends hudson.slaves.Cloud {
 
     private static final String LIST_CHOOSE = "-- Choose one --";
     private static final String LIST_NO_ITEM = "no-item-present";
+    
+    // Track pending provisions to prevent over-provisioning with unique agents
+    // Key: cloud name + label, Value: timestamp of last provision
+    private static final ConcurrentHashMap<String, Instant> pendingProvisions = new ConcurrentHashMap<>();
 
     private String org;
 
@@ -78,6 +85,10 @@ public class Cloud extends hudson.slaves.Cloud {
     private int memory;
 
     private int retentionMins;
+    
+    // Cooldown period between provisions for unique agents (in seconds)
+    // This prevents Jenkins from provisioning multiple agents before the first one connects
+    private int provisioningCooldownSecs;
 
     private String agentImage;
 
@@ -105,6 +116,7 @@ public class Cloud extends hudson.slaves.Cloud {
                  int cpu,
                  int memory,
                  int retentionMins,
+                 int provisioningCooldownSecs,
                  String agentImage,
                  String volumeSetName,
                  String volumeSetPath,
@@ -122,6 +134,7 @@ public class Cloud extends hudson.slaves.Cloud {
         this.cpu = cpu;
         this.memory = memory;
         this.retentionMins = retentionMins;
+        this.provisioningCooldownSecs = provisioningCooldownSecs > 0 ? provisioningCooldownSecs : 60;
         this.agentImage = agentImage;
         this.volumeSetName = volumeSetName;
         this.volumeSetPath = volumeSetPath;
@@ -238,6 +251,16 @@ public class Cloud extends hudson.slaves.Cloud {
     public void setRetentionMins(int retentionMins) {
         this.retentionMins = retentionMins;
     }
+    
+    public int getProvisioningCooldownSecs() {
+        return provisioningCooldownSecs > 0 ? provisioningCooldownSecs : 60;
+    }
+
+    @DataBoundSetter
+    @SuppressWarnings("unused")
+    public void setProvisioningCooldownSecs(int provisioningCooldownSecs) {
+        this.provisioningCooldownSecs = provisioningCooldownSecs > 0 ? provisioningCooldownSecs : 60;
+    }
 
     @DataBoundSetter
     @SuppressWarnings("unused")
@@ -342,8 +365,50 @@ public class Cloud extends hudson.slaves.Cloud {
                     .filter(n -> n.getNodeName().equals(agentNameUnlabeled));
             nodeSet = nodes.collect(Collectors.toSet());
         } else {
-            realExcessWorkload = excessWorkload;
+            // For unique agents, we need to be smarter about provisioning
+            // Don't just provision excessWorkload agents, but consider what's already pending
+            int pendingAgents = countPendingAgents(label);
+            int onlineAgents = countOnlineAgents(label);
+            
+            // Calculate how many agents we actually need
+            // excessWorkload is how many MORE executors Jenkins wants
+            // We should provision to meet that demand, minus what's already pending
+            int effectiveExcess = excessWorkload - pendingAgents;
+            
+            if (effectiveExcess <= 0) {
+                LOGGER.log(INFO, "Skipping provision for {0} - {1} agent(s) already pending, excess={2}",
+                        new Object[]{this, pendingAgents, excessWorkload});
+                return Collections.emptyList();
+            }
+            
+            // Apply cooldown: only provision one agent at a time with cooldown between
+            String cooldownKey = name + ":" + label;
+            Instant lastProvision = pendingProvisions.get(cooldownKey);
+            if (lastProvision != null) {
+                long secondsSinceLastProvision = java.time.Duration.between(lastProvision, Instant.now()).getSeconds();
+                if (secondsSinceLastProvision < getProvisioningCooldownSecs()) {
+                    // Still in cooldown, but if we have a lot of demand, provision anyway
+                    // This allows scaling up quickly when there's real demand
+                    if (pendingAgents == 0 && effectiveExcess > 1) {
+                        LOGGER.log(INFO, "Provisioning despite cooldown for {0} - high demand ({1} excess, 0 pending)",
+                                new Object[]{this, effectiveExcess});
+                        // Allow 1 provision
+                        realExcessWorkload = 1;
+                    } else {
+                        LOGGER.log(FINE, "Skipping provision for {0} - within cooldown period ({1}s since last provision)",
+                                new Object[]{this, secondsSinceLastProvision});
+                        return Collections.emptyList();
+                    }
+                } else {
+                    // Cooldown expired, provision based on effective excess (but cap at 1 per cycle)
+                    realExcessWorkload = 1;
+                }
+            } else {
+                // No cooldown active, provision 1 agent
+                realExcessWorkload = 1;
+            }
         }
+        
         if (!getUseUniqueAgents() && !nodeSet.isEmpty()) {
             String labelInfo = label.isEmpty() ? "no label" : String.format("label: %s", label);
             LOGGER.log(INFO, "Agent found for {0}: {1} for tasks with {2}",
@@ -358,7 +423,11 @@ public class Cloud extends hudson.slaves.Cloud {
 
         try {
             Set<NodeProvisioner.PlannedNode> plannedNodes = new LinkedHashSet<>();
-            while (realExcessWorkload-- > 0) {
+            
+            // For unique agents, only provision one at a time to prevent over-provisioning
+            int toProvision = getUseUniqueAgents() ? 1 : realExcessWorkload;
+            
+            while (toProvision-- > 0) {
                 String agentName = getAgentName(agentNameBase);
                 Agent agent = new Agent(agentName, "", new Launcher());
                 agent.setCloud(this);
@@ -369,9 +438,18 @@ public class Cloud extends hudson.slaves.Cloud {
                 // Track the workload for reconciliation
                 WorkloadReconciler.trackWorkload(agentName, this.name, null);
                 
+                // Update cooldown timestamp for unique agents
+                if (getUseUniqueAgents()) {
+                    String cooldownKey = name + ":" + label;
+                    pendingProvisions.put(cooldownKey, Instant.now());
+                }
+                
                 NodeProvisioner.PlannedNode node = new NodeProvisioner.PlannedNode(
                         name, CompletableFuture.completedFuture(agent), getExecutors());
                 plannedNodes.add(node);
+                
+                LOGGER.log(INFO, "Provisioning agent {0} for cloud {1}",
+                        new Object[]{agentName, this});
             }
             return plannedNodes;
         } catch (Descriptor.FormException | IOException e) {
@@ -379,6 +457,69 @@ public class Cloud extends hudson.slaves.Cloud {
                     new Object[]{this, e});
             return Collections.emptyList();
         }
+    }
+    
+    /**
+     * Count agents for this cloud that are pending (not yet online).
+     */
+    private int countPendingAgents(String label) {
+        Jenkins jenkins = Jenkins.getInstanceOrNull();
+        if (jenkins == null) return 0;
+        
+        int pending = 0;
+        for (Node node : jenkins.getNodes()) {
+            if (node instanceof Agent) {
+                Agent agent = (Agent) node;
+                if (agent.getCloud() != null && name.equals(agent.getCloud().name)) {
+                    // Check if labels match
+                    String agentLabel = agent.getLabelString();
+                    if ((label.isEmpty() && Strings.isNullOrEmpty(agentLabel)) ||
+                        label.equals(agentLabel)) {
+                        hudson.model.Computer computer = agent.toComputer();
+                        if (computer != null && !computer.isOnline()) {
+                            pending++;
+                        }
+                    }
+                }
+            }
+        }
+        return pending;
+    }
+    
+    /**
+     * Count agents for this cloud that are online.
+     */
+    private int countOnlineAgents(String label) {
+        Jenkins jenkins = Jenkins.getInstanceOrNull();
+        if (jenkins == null) return 0;
+        
+        int online = 0;
+        for (Node node : jenkins.getNodes()) {
+            if (node instanceof Agent) {
+                Agent agent = (Agent) node;
+                if (agent.getCloud() != null && name.equals(agent.getCloud().name)) {
+                    // Check if labels match
+                    String agentLabel = agent.getLabelString();
+                    if ((label.isEmpty() && Strings.isNullOrEmpty(agentLabel)) ||
+                        label.equals(agentLabel)) {
+                        hudson.model.Computer computer = agent.toComputer();
+                        if (computer != null && computer.isOnline()) {
+                            online++;
+                        }
+                    }
+                }
+            }
+        }
+        return online;
+    }
+    
+    /**
+     * Clear the cooldown for this cloud (called when an agent comes online).
+     */
+    public static void clearProvisioningCooldown(String cloudName, String label) {
+        String cooldownKey = cloudName + ":" + (label != null ? label : "");
+        pendingProvisions.remove(cooldownKey);
+        LOGGER.log(FINE, "Cleared provisioning cooldown for {0}", cooldownKey);
     }
 
     @SuppressWarnings("unused")
@@ -629,6 +770,15 @@ public class Cloud extends hudson.slaves.Cloud {
                 return FormValidation
                         .error(String.format("The Idle Agent Retention Time must be >= 1 minute, found %d",
                                 retentionMins));
+            }
+            return FormValidation.ok();
+        }
+        
+        public FormValidation doCheckProvisioningCooldownSecs(@QueryParameter int provisioningCooldownSecs) {
+            if (provisioningCooldownSecs < 0) {
+                return FormValidation
+                        .error(String.format("The Provisioning Cooldown must be >= 0 seconds, found %d",
+                                provisioningCooldownSecs));
             }
             return FormValidation.ok();
         }

@@ -1,0 +1,33 @@
+<div>
+    <p>
+        Specify the cooldown period in seconds between provisioning new agents when using unique agents.
+    </p>
+    <p>
+        <strong>Default:</strong> 60 seconds
+    </p>
+    <p>
+        <strong>Purpose:</strong> This setting prevents Jenkins from over-provisioning agents when
+        using the "Use Unique Agents" option. Without this cooldown, Jenkins may provision multiple
+        agents for a single job because the NodeProvisioner doesn't wait for agents to connect before
+        requesting more.
+    </p>
+    <p>
+        <strong>How it works:</strong>
+        <ul>
+            <li>When a new agent is provisioned, a cooldown timer starts</li>
+            <li>Additional provision requests during the cooldown are skipped</li>
+            <li>The cooldown is cleared when an agent comes online</li>
+            <li>The plugin also checks for pending (not yet online) agents before provisioning</li>
+        </ul>
+    </p>
+    <p>
+        <strong>Recommendations:</strong>
+        <ul>
+            <li>Set this to roughly how long it takes for a CPLN workload to start and connect</li>
+            <li>60 seconds is usually a good starting point</li>
+            <li>Increase if you see multiple agents being provisioned for single jobs</li>
+            <li>Set to 0 to disable cooldown (not recommended with unique agents)</li>
+        </ul>
+    </p>
+</div>
+

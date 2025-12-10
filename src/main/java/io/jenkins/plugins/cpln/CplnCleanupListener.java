@@ -3,6 +3,7 @@ package io.jenkins.plugins.cpln;
 import edu.umd.cs.findbugs.annotations.NonNull;
 import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import hudson.Extension;
+import hudson.model.Executor;
 import hudson.model.TaskListener;
 import hudson.slaves.ComputerListener;
 import hudson.slaves.OfflineCause;
@@ -33,6 +34,7 @@ import static java.util.logging.Level.*;
  * - Triggers cleanup on ANY offline event, not just graceful termination
  * - Schedules delayed cleanup for transient failures
  * - Integrates with the WorkloadReconciler for orphan cleanup
+ * - NEVER deletes agents that have active/busy executors
  */
 @Extension
 @SuppressFBWarnings
@@ -72,14 +74,18 @@ public class CplnCleanupListener extends ComputerListener {
         }
         
         String workloadName = agent.getNodeName();
+        Cloud cloud = agent.getCloud();
         
         // Cancel any pending cleanup since the agent came online
         pendingCleanups.remove(workloadName);
         
-        LOGGER.log(INFO, "CPLN agent {0} came online, cancelled any pending cleanup", workloadName);
+        // Clear the provisioning cooldown so new agents can be provisioned for other jobs
+        Cloud.clearProvisioningCooldown(cloud.name, agent.getLabelString());
+        
+        LOGGER.log(INFO, "CPLN agent {0} came online, cancelled any pending cleanup and cleared provisioning cooldown", workloadName);
         
         // Update workload tracking
-        WorkloadReconciler.trackWorkload(workloadName, agent.getCloud().name, null);
+        WorkloadReconciler.trackWorkload(workloadName, cloud.name, null);
     }
 
     /**
@@ -102,6 +108,13 @@ public class CplnCleanupListener extends ComputerListener {
         // This prevents cleanup during initial startup when the agent hasn't connected yet
         if (!computer.isWorkloadProvisioned()) {
             LOGGER.log(FINE, "Ignoring offline event for {0} - workload not yet provisioned", 
+                    computer.getName());
+            return;
+        }
+        
+        // CRITICAL: Never cleanup if there are busy executors (running builds)
+        if (hasBusyExecutors(c)) {
+            LOGGER.log(INFO, "Ignoring offline event for {0} - agent has busy executors", 
                     computer.getName());
             return;
         }
@@ -144,6 +157,13 @@ public class CplnCleanupListener extends ComputerListener {
             return;
         }
         
+        // CRITICAL: Never cleanup if there are busy executors
+        if (hasBusyExecutors(c)) {
+            LOGGER.log(INFO, "Ignoring launch failure for {0} - agent has busy executors", 
+                    computer.getName());
+            return;
+        }
+        
         String workloadName = agent.getNodeName();
         Cloud cloud = agent.getCloud();
         
@@ -164,6 +184,28 @@ public class CplnCleanupListener extends ComputerListener {
         // Do nothing - let the periodic reconciler handle orphan cleanup
         // Forcing reconciliation here can interfere with node creation
         LOGGER.log(FINE, "Configuration change detected, periodic reconciler will handle cleanup");
+    }
+
+    /**
+     * Check if a computer has any busy executors (running builds).
+     */
+    private boolean hasBusyExecutors(hudson.model.Computer computer) {
+        if (computer == null) return false;
+        
+        for (Executor executor : computer.getExecutors()) {
+            if (executor.isBusy()) {
+                return true;
+            }
+        }
+        
+        // Also check one-off executors
+        for (Executor executor : computer.getOneOffExecutors()) {
+            if (executor.isBusy()) {
+                return true;
+            }
+        }
+        
+        return false;
     }
 
     /**
@@ -206,13 +248,32 @@ public class CplnCleanupListener extends ComputerListener {
             return;
         }
         
-        // Check if agent reconnected
         Jenkins jenkins = Jenkins.getInstanceOrNull();
         if (jenkins != null) {
             hudson.model.Computer computer = jenkins.getComputer(workloadName);
+            
+            // Check if agent reconnected
             if (computer != null && computer.isOnline()) {
                 LOGGER.log(INFO, "Skipping cleanup for workload {0} - agent is back online", workloadName);
                 pendingCleanups.remove(workloadName);
+                return;
+            }
+            
+            // CRITICAL: Check if agent has busy executors (running builds)
+            if (computer != null && hasBusyExecutors(computer)) {
+                LOGGER.log(INFO, "Skipping cleanup for workload {0} - agent has busy executors (running builds)", workloadName);
+                pendingCleanups.remove(workloadName);
+                // Reschedule cleanup for later
+                scheduleCleanup(workloadName, cloud, reason + " (rescheduled - had busy executors)");
+                return;
+            }
+            
+            // Check if there are queued builds waiting for this agent
+            if (computer != null && hasQueuedBuilds(computer)) {
+                LOGGER.log(INFO, "Skipping cleanup for workload {0} - there are builds queued for this agent", workloadName);
+                pendingCleanups.remove(workloadName);
+                // Reschedule cleanup for later
+                scheduleCleanup(workloadName, cloud, reason + " (rescheduled - had queued builds)");
                 return;
             }
         }
@@ -248,6 +309,32 @@ public class CplnCleanupListener extends ComputerListener {
             WorkloadReconciler.untrackWorkload(workloadName);
         }
     }
+    
+    /**
+     * Check if there are queued builds that could run on this computer.
+     */
+    private boolean hasQueuedBuilds(hudson.model.Computer computer) {
+        if (computer == null) return false;
+        
+        Jenkins jenkins = Jenkins.getInstanceOrNull();
+        if (jenkins == null) return false;
+        
+        hudson.model.Node node = computer.getNode();
+        if (node == null) return false;
+        
+        // Check the build queue for items that can run on this node
+        for (hudson.model.Queue.Item item : jenkins.getQueue().getItems()) {
+            if (item.getAssignedLabel() == null) {
+                // Unlabeled job - could potentially run on this node
+                return true;
+            }
+            if (item.getAssignedLabel().matches(node)) {
+                return true;
+            }
+        }
+        
+        return false;
+    }
 
     /**
      * Determine if an offline cause indicates a permanent failure that requires cleanup.
@@ -275,8 +362,29 @@ public class CplnCleanupListener extends ComputerListener {
 
     /**
      * Force immediate cleanup of a workload (for external callers).
+     * Will NOT cleanup if the agent has busy executors.
      */
     public static void forceCleanup(String workloadName, Cloud cloud, String reason) {
+        // First check if agent has busy executors
+        Jenkins jenkins = Jenkins.getInstanceOrNull();
+        if (jenkins != null) {
+            hudson.model.Computer computer = jenkins.getComputer(workloadName);
+            if (computer != null) {
+                for (Executor executor : computer.getExecutors()) {
+                    if (executor.isBusy()) {
+                        LOGGER.log(WARNING, "Refusing force cleanup for workload {0} - agent has busy executors", workloadName);
+                        return;
+                    }
+                }
+                for (Executor executor : computer.getOneOffExecutors()) {
+                    if (executor.isBusy()) {
+                        LOGGER.log(WARNING, "Refusing force cleanup for workload {0} - agent has busy one-off executors", workloadName);
+                        return;
+                    }
+                }
+            }
+        }
+        
         pendingCleanups.remove(workloadName);
         
         LOGGER.log(INFO, "Force cleanup requested for workload {0}. Reason: {1}",
@@ -284,6 +392,20 @@ public class CplnCleanupListener extends ComputerListener {
         
         cleanupExecutor.execute(() -> {
             try {
+                // Double-check busy executors before deleting
+                Jenkins j = Jenkins.getInstanceOrNull();
+                if (j != null) {
+                    hudson.model.Computer comp = j.getComputer(workloadName);
+                    if (comp != null) {
+                        for (Executor executor : comp.getExecutors()) {
+                            if (executor.isBusy()) {
+                                LOGGER.log(WARNING, "Aborting force cleanup for workload {0} - agent now has busy executors", workloadName);
+                                return;
+                            }
+                        }
+                    }
+                }
+                
                 boolean deleted = WorkloadReconciler.deleteWorkload(cloud, workloadName);
                 if (deleted) {
                     LOGGER.log(INFO, "Force cleanup successful for workload {0}", workloadName);
@@ -310,4 +432,3 @@ public class CplnCleanupListener extends ComputerListener {
         return pendingCleanups.containsKey(workloadName);
     }
 }
-

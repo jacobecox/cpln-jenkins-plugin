@@ -174,6 +174,20 @@ public class WorkloadReconciler extends AsyncPeriodicWork {
                 }
 
                 if (shouldDelete) {
+                    // CRITICAL: Check if agent has busy executors before deleting
+                    if (hasBusyExecutors(jenkins, workload.name)) {
+                        LOGGER.log(INFO, "Skipping deletion of workload {0} - agent has busy executors (running builds)",
+                                workload.name);
+                        continue;
+                    }
+                    
+                    // Check if there are queued builds for this agent
+                    if (hasQueuedBuilds(jenkins, workload.name)) {
+                        LOGGER.log(INFO, "Skipping deletion of workload {0} - there are builds queued for this agent",
+                                workload.name);
+                        continue;
+                    }
+                    
                     LOGGER.log(INFO, "Deleting workload {0} on cloud {1}: {2}",
                             new Object[]{workload.name, cloud, reason});
                     deleteWorkload(cloud, workload.name);
@@ -193,6 +207,51 @@ public class WorkloadReconciler extends AsyncPeriodicWork {
             LOGGER.log(WARNING, "Error reconciling cloud {0}: {1}",
                     new Object[]{cloud, e.getMessage()});
         }
+    }
+
+    /**
+     * Check if a computer has any busy executors (running builds).
+     */
+    private boolean hasBusyExecutors(Jenkins jenkins, String computerName) {
+        hudson.model.Computer computer = jenkins.getComputer(computerName);
+        if (computer == null) return false;
+        
+        for (hudson.model.Executor executor : computer.getExecutors()) {
+            if (executor.isBusy()) {
+                return true;
+            }
+        }
+        
+        for (hudson.model.Executor executor : computer.getOneOffExecutors()) {
+            if (executor.isBusy()) {
+                return true;
+            }
+        }
+        
+        return false;
+    }
+    
+    /**
+     * Check if there are queued builds that could run on this computer.
+     */
+    private boolean hasQueuedBuilds(Jenkins jenkins, String computerName) {
+        hudson.model.Computer computer = jenkins.getComputer(computerName);
+        if (computer == null) return false;
+        
+        hudson.model.Node node = computer.getNode();
+        if (node == null) return false;
+        
+        for (hudson.model.Queue.Item item : jenkins.getQueue().getItems()) {
+            if (item.getAssignedLabel() == null) {
+                // Unlabeled job - could potentially run on this node
+                return true;
+            }
+            if (item.getAssignedLabel().matches(node)) {
+                return true;
+            }
+        }
+        
+        return false;
     }
 
     /**
