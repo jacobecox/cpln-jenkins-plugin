@@ -239,6 +239,7 @@ public class CplnCleanupListener extends ComputerListener {
 
     /**
      * Execute the actual cleanup.
+     * IMPORTANT: Uses CplnCleanup to ensure correct order: node first, then workload.
      */
     private void executeCleanup(String workloadName, Cloud cloud, String reason) {
         // Check if cleanup is still needed (agent might have reconnected)
@@ -282,31 +283,12 @@ public class CplnCleanupListener extends ComputerListener {
                 new Object[]{workloadName, reason});
         
         try {
-            // Delete the workload via CPLN API
-            boolean deleted = WorkloadReconciler.deleteWorkload(cloud, workloadName);
-            
-            if (deleted) {
-                LOGGER.log(INFO, "Successfully cleaned up workload {0}", workloadName);
-                
-                // Also remove the Jenkins node if it still exists
-                if (jenkins != null) {
-                    hudson.model.Node node = jenkins.getNode(workloadName);
-                    if (node != null) {
-                        try {
-                            jenkins.removeNode(node);
-                            LOGGER.log(INFO, "Removed Jenkins node {0}", workloadName);
-                        } catch (Exception e) {
-                            LOGGER.log(WARNING, "Failed to remove Jenkins node {0}: {1}",
-                                    new Object[]{workloadName, e.getMessage()});
-                        }
-                    }
-                }
-            } else {
-                LOGGER.log(WARNING, "Failed to cleanup workload {0}, will retry via reconciler", workloadName);
-            }
+            // CRITICAL: Use centralized cleanup which ensures correct order:
+            // 1. Remove Jenkins node FIRST (prevents scheduling on stale node)
+            // 2. Delete CPLN workload SECOND
+            CplnCleanup.cleanupNodeAndWorkload(cloud, workloadName, reason);
         } finally {
             pendingCleanups.remove(workloadName);
-            WorkloadReconciler.untrackWorkload(workloadName);
         }
     }
     
@@ -363,26 +345,13 @@ public class CplnCleanupListener extends ComputerListener {
     /**
      * Force immediate cleanup of a workload (for external callers).
      * Will NOT cleanup if the agent has busy executors.
+     * Uses CplnCleanup to ensure correct order: node first, then workload.
      */
     public static void forceCleanup(String workloadName, Cloud cloud, String reason) {
         // First check if agent has busy executors
-        Jenkins jenkins = Jenkins.getInstanceOrNull();
-        if (jenkins != null) {
-            hudson.model.Computer computer = jenkins.getComputer(workloadName);
-            if (computer != null) {
-                for (Executor executor : computer.getExecutors()) {
-                    if (executor.isBusy()) {
-                        LOGGER.log(WARNING, "Refusing force cleanup for workload {0} - agent has busy executors", workloadName);
-                        return;
-                    }
-                }
-                for (Executor executor : computer.getOneOffExecutors()) {
-                    if (executor.isBusy()) {
-                        LOGGER.log(WARNING, "Refusing force cleanup for workload {0} - agent has busy one-off executors", workloadName);
-                        return;
-                    }
-                }
-            }
+        if (CplnCleanup.hasBusyExecutors(workloadName)) {
+            LOGGER.log(WARNING, "Refusing force cleanup for workload {0} - agent has busy executors", workloadName);
+            return;
         }
         
         pendingCleanups.remove(workloadName);
@@ -390,30 +359,9 @@ public class CplnCleanupListener extends ComputerListener {
         LOGGER.log(INFO, "Force cleanup requested for workload {0}. Reason: {1}",
                 new Object[]{workloadName, reason});
         
-        cleanupExecutor.execute(() -> {
-            try {
-                // Double-check busy executors before deleting
-                Jenkins j = Jenkins.getInstanceOrNull();
-                if (j != null) {
-                    hudson.model.Computer comp = j.getComputer(workloadName);
-                    if (comp != null) {
-                        for (Executor executor : comp.getExecutors()) {
-                            if (executor.isBusy()) {
-                                LOGGER.log(WARNING, "Aborting force cleanup for workload {0} - agent now has busy executors", workloadName);
-                                return;
-                            }
-                        }
-                    }
-                }
-                
-                boolean deleted = WorkloadReconciler.deleteWorkload(cloud, workloadName);
-                if (deleted) {
-                    LOGGER.log(INFO, "Force cleanup successful for workload {0}", workloadName);
-                }
-            } finally {
-                WorkloadReconciler.untrackWorkload(workloadName);
-            }
-        });
+        // Execute cleanup synchronously to ensure it completes before returning
+        // This prevents race conditions where new builds are scheduled on stale nodes
+        CplnCleanup.cleanupNodeAndWorkload(cloud, workloadName, reason);
     }
 
     /**

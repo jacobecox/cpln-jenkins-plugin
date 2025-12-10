@@ -360,9 +360,34 @@ public class Cloud extends hudson.slaves.Cloud {
         Set<Node> nodeSet = new LinkedHashSet<>();
         if (!getUseUniqueAgents()) {
             final String agentNameUnlabeled = agentNameBase;
+            
+            // CRITICAL SAFETY CHECK: Before reusing any existing node, verify its workload exists
+            // This prevents scheduling builds on stale nodes whose workloads were deleted
+            Node existingNode = Jenkins.get().getNode(agentNameUnlabeled);
+            if (existingNode != null && existingNode instanceof Agent) {
+                if (!CplnCleanup.workloadExists(this, agentNameUnlabeled)) {
+                    LOGGER.log(WARNING, "Node {0} has no backing workload. Removing stale node before provisioning.",
+                            agentNameUnlabeled);
+                    CplnCleanup.removeNodeSync(agentNameUnlabeled);
+                    // Don't add this stale node to nodeSet
+                    existingNode = null;
+                }
+            }
+            
             nodes = nodes.filter(Agent.class::isInstance)
                     .filter(Node::isAcceptingTasks)
-                    .filter(n -> n.getNodeName().equals(agentNameUnlabeled));
+                    .filter(n -> n.getNodeName().equals(agentNameUnlabeled))
+                    // Additional filter: only include nodes whose workloads exist
+                    .filter(n -> {
+                        if (CplnCleanup.workloadExists(this, n.getNodeName())) {
+                            return true;
+                        } else {
+                            LOGGER.log(WARNING, "Filtering out node {0} - no backing workload exists", n.getNodeName());
+                            // Schedule async removal of this stale node
+                            CplnCleanup.removeNodeSync(n.getNodeName());
+                            return false;
+                        }
+                    });
             nodeSet = nodes.collect(Collectors.toSet());
         } else {
             // For unique agents, we need to be smarter about provisioning

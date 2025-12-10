@@ -188,9 +188,14 @@ public class WorkloadReconciler extends AsyncPeriodicWork {
                         continue;
                     }
                     
-                    LOGGER.log(INFO, "Deleting workload {0} on cloud {1}: {2}",
+                    LOGGER.log(INFO, "Cleaning up workload {0} on cloud {1}: {2}",
                             new Object[]{workload.name, cloud, reason});
-                    deleteWorkload(cloud, workload.name);
+                    
+                    // CRITICAL: Use centralized cleanup which ensures correct order:
+                    // 1. Remove Jenkins node FIRST (prevents scheduling on stale node)
+                    // 2. Delete CPLN workload SECOND
+                    CplnCleanup.cleanupNodeAndWorkload(cloud, workload.name, reason);
+                    
                     orphanFirstSeen.remove(workload.name);
                     trackedWorkloads.remove(workload.name);
                 }
@@ -363,31 +368,13 @@ public class WorkloadReconciler extends AsyncPeriodicWork {
 
     /**
      * Delete a workload via CPLN API.
+     * IMPORTANT: This method uses CplnCleanup to ensure correct order:
+     * 1. Remove Jenkins node FIRST (prevents scheduling on stale node)
+     * 2. Delete CPLN workload SECOND
      */
     public static boolean deleteWorkload(Cloud cloud, String workloadName) {
-        try {
-            LOGGER.log(INFO, "Reconciler deleting workload {0} on cloud {1}",
-                    new Object[]{workloadName, cloud});
-            
-            HttpResponse<String> response = send(request(
-                    String.format(Workload.DELETEURI, cloud.getOrg(), cloud.getGvc(), workloadName),
-                    SendType.DELETE, cloud.getApiKey().getPlainText()));
-            
-            if (response.statusCode() == 202 || response.statusCode() == 200 || 
-                response.statusCode() == 204 || response.statusCode() == 404) {
-                LOGGER.log(INFO, "Successfully requested deletion of workload {0}", workloadName);
-                return true;
-            }
-            
-            LOGGER.log(WARNING, "Failed to delete workload {0}: {1} - {2}",
-                    new Object[]{workloadName, response.statusCode(), response.body()});
-            return false;
-            
-        } catch (Exception e) {
-            LOGGER.log(WARNING, "Error deleting workload {0}: {1}",
-                    new Object[]{workloadName, e.getMessage()});
-            return false;
-        }
+        // Use centralized cleanup which handles the correct order
+        return CplnCleanup.cleanupNodeAndWorkload(cloud, workloadName, "reconciler cleanup");
     }
 
     /**

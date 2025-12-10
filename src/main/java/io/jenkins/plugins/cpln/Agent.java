@@ -7,16 +7,11 @@ import hudson.model.Descriptor;
 import hudson.model.TaskListener;
 import hudson.slaves.AbstractCloudSlave;
 import hudson.slaves.ComputerLauncher;
-import io.jenkins.plugins.cpln.model.Workload;
 import org.kohsuke.stapler.DataBoundConstructor;
 
 import java.io.IOException;
-import java.net.http.HttpResponse;
-import java.util.Objects;
 import java.util.logging.Logger;
 
-import static io.jenkins.plugins.cpln.Utils.request;
-import static io.jenkins.plugins.cpln.Utils.send;
 import static java.util.logging.Level.*;
 
 /**
@@ -91,6 +86,10 @@ public class Agent extends AbstractCloudSlave {
     /**
      * Terminate the agent and clean up the CPLN workload.
      * 
+     * IMPORTANT: This method is called by Jenkins AFTER the node is already being removed.
+     * The node removal is handled by Jenkins' AbstractCloudSlave, so we only need to
+     * delete the CPLN workload here.
+     * 
      * This method is called by Jenkins when:
      * - The retention strategy decides the agent should be removed
      * - The agent is manually deleted
@@ -126,74 +125,15 @@ public class Agent extends AbstractCloudSlave {
             LOGGER.log(INFO, "Terminating agent {0} on cloud {1}, deleting workload {2}...",
                     new Object[]{getNodeName(), effectiveCloud, getWorkloadName()});
             
-            deleteWorkloadWithRetry(effectiveCloud, getWorkloadName(), 3);
+            // Delete the CPLN workload synchronously
+            // Note: The Jenkins node is already being removed by AbstractCloudSlave
+            // so we only need to delete the CPLN workload here
+            CplnCleanup.deleteWorkloadSync(effectiveCloud, getWorkloadName());
             
         } finally {
             // Always untrack the workload
             WorkloadReconciler.untrackWorkload(getWorkloadName());
         }
-    }
-
-    /**
-     * Delete a workload with retry logic.
-     */
-    private void deleteWorkloadWithRetry(Cloud cloud, String workloadName, int maxRetries) {
-        Exception lastException = null;
-        
-        for (int attempt = 1; attempt <= maxRetries; attempt++) {
-            try {
-                HttpResponse<String> response = send(request(
-                        String.format(Workload.DELETEURI, cloud.getOrg(), cloud.getGvc(), workloadName),
-                        SendType.DELETE, cloud.getApiKey().getPlainText()));
-                
-                int statusCode = response.statusCode();
-                
-                if (statusCode == 202 || statusCode == 200 || statusCode == 204) {
-                    LOGGER.log(INFO, "Successfully deleted workload {0} on cloud {1}",
-                            new Object[]{workloadName, cloud});
-                    return;
-                }
-                
-                if (statusCode == 404) {
-                    LOGGER.log(INFO, "Workload {0} not found (already deleted?) on cloud {1}",
-                            new Object[]{workloadName, cloud});
-                    return;
-                }
-                
-                // Log warning but continue retry
-                LOGGER.log(WARNING, "Delete attempt {0} failed for workload {1}: {2} - {3}",
-                        new Object[]{attempt, workloadName, statusCode, response.body()});
-                
-                if (attempt < maxRetries) {
-                    // Wait before retry (exponential backoff)
-                    Thread.sleep(1000L * attempt);
-                }
-                
-            } catch (InterruptedException ie) {
-                Thread.currentThread().interrupt();
-                LOGGER.log(WARNING, "Interrupted while deleting workload {0}", workloadName);
-                return;
-            } catch (Exception e) {
-                lastException = e;
-                LOGGER.log(WARNING, "Delete attempt {0} failed for workload {1}: {2}",
-                        new Object[]{attempt, workloadName, e.getMessage()});
-                
-                if (attempt < maxRetries) {
-                    try {
-                        Thread.sleep(1000L * attempt);
-                    } catch (InterruptedException ie) {
-                        Thread.currentThread().interrupt();
-                        return;
-                    }
-                }
-            }
-        }
-        
-        // All retries failed, log and let reconciler handle it
-        LOGGER.log(WARNING, "All {0} attempts to delete workload {1} failed. " +
-                        "WorkloadReconciler will handle cleanup. Last error: {2}",
-                new Object[]{maxRetries, workloadName, 
-                        lastException != null ? lastException.getMessage() : "unknown"});
     }
 
     /**
