@@ -96,39 +96,52 @@ public class StuckAgentDetector extends AsyncPeriodicWork {
     protected void execute(TaskListener listener) {
         Jenkins jenkins = Jenkins.getInstanceOrNull();
         if (jenkins == null) {
+            LOGGER.log(WARNING, "StuckAgentDetector: Jenkins instance is null, skipping");
             return;
         }
 
-        LOGGER.log(FINE, "Running stuck agent detection...");
+        LOGGER.log(INFO, "StuckAgentDetector: Running detection cycle. Total nodes: {0}", 
+                jenkins.getNodes().size());
 
+        int cplnAgentCount = 0;
+        int checkedCount = 0;
+        
         // Process each CPLN agent
         for (Node node : jenkins.getNodes()) {
+            LOGGER.log(FINE, "StuckAgentDetector: Checking node {0}, type: {1}", 
+                    new Object[]{node.getNodeName(), node.getClass().getSimpleName()});
+            
             if (!(node instanceof Agent)) {
+                LOGGER.log(FINE, "StuckAgentDetector: Node {0} is NOT a CPLN Agent, skipping", 
+                        node.getNodeName());
                 continue;
             }
+            
+            cplnAgentCount++;
 
             Agent agent = (Agent) node;
             Cloud cloud = agent.getCloud();
 
             if (cloud == null) {
+                LOGGER.log(WARNING, "StuckAgentDetector: Agent {0} has null cloud, skipping", 
+                        node.getNodeName());
                 continue;
             }
 
-            // RULE 1: Only check unique agents
-            // Shared agents are expected to persist, unique agents should terminate after builds
-            if (!cloud.getUseUniqueAgents()) {
-                potentiallyStuck.remove(node.getNodeName());
-                continue;
-            }
-
+            // NOTE: We now check ALL agents, not just unique agents
+            // High response time or stalled channel is a problem regardless of agent type
+            LOGGER.log(INFO, "StuckAgentDetector: Checking CPLN agent {0} (unique={1})", 
+                    new Object[]{node.getNodeName(), cloud.getUseUniqueAgents()});
+            
+            checkedCount++;
             checkAgentForStuckState(agent, cloud, jenkins);
         }
 
         // Clean up tracking for nodes that no longer exist
         potentiallyStuck.keySet().removeIf(name -> jenkins.getNode(name) == null);
 
-        LOGGER.log(FINE, "Stuck agent detection completed. Tracking {0} potentially stuck agents.",
-                potentiallyStuck.size());
+        LOGGER.log(INFO, "StuckAgentDetector: Completed. CPLN agents: {0}, Checked: {1}, Tracking: {2}",
+                new Object[]{cplnAgentCount, checkedCount, potentiallyStuck.size()});
     }
 
     /**
@@ -141,45 +154,60 @@ public class StuckAgentDetector extends AsyncPeriodicWork {
         hudson.model.Computer computer = jenkins.getComputer(nodeName);
 
         if (computer == null) {
+            LOGGER.log(INFO, "StuckAgentDetector: Computer for {0} is null", nodeName);
             potentiallyStuck.remove(nodeName);
             return;
         }
 
         // RULE 2: Agent must be "online"
         // If it's offline, normal cleanup mechanisms should handle it
-        if (computer.isOffline()) {
+        boolean isOffline = computer.isOffline();
+        LOGGER.log(INFO, "StuckAgentDetector: Agent {0} online={1}", 
+                new Object[]{nodeName, !isOffline});
+        if (isOffline) {
             potentiallyStuck.remove(nodeName);
-            LOGGER.log(FINE, "Agent {0} is offline, skipping stuck detection", nodeName);
+            LOGGER.log(INFO, "StuckAgentDetector: Agent {0} is OFFLINE, skipping", nodeName);
             return;
         }
 
         // RULE 3: Agent must have NO busy executors
-        // If build is still running, this is not a stuck agent
-        if (hasBusyExecutors(computer)) {
+        // If build is still running, this is not a stuck agent (StalledBuildDetector handles that)
+        boolean hasBusy = hasBusyExecutors(computer);
+        LOGGER.log(INFO, "StuckAgentDetector: Agent {0} hasBusyExecutors={1}", 
+                new Object[]{nodeName, hasBusy});
+        if (hasBusy) {
             potentiallyStuck.remove(nodeName);
-            LOGGER.log(FINE, "Agent {0} has busy executors, not stuck", nodeName);
+            LOGGER.log(INFO, "StuckAgentDetector: Agent {0} has BUSY executors, delegating to StalledBuildDetector", nodeName);
             return;
         }
 
         // RULE 4: CPLN workload must still exist
         // If workload is gone, different cleanup path handles it
-        if (!CplnCleanup.workloadExists(cloud, nodeName)) {
+        boolean workloadExists = CplnCleanup.workloadExists(cloud, nodeName);
+        LOGGER.log(INFO, "StuckAgentDetector: Agent {0} workloadExists={1}", 
+                new Object[]{nodeName, workloadExists});
+        if (!workloadExists) {
             potentiallyStuck.remove(nodeName);
-            LOGGER.log(FINE, "Agent {0} workload doesn't exist, skipping stuck detection", nodeName);
+            LOGGER.log(INFO, "StuckAgentDetector: Agent {0} workload DOESN'T EXIST, skipping", nodeName);
             return;
         }
 
         // RULE 5 & 6: Check for channel staleness indicators
         ChannelHealth channelHealth = assessChannelHealth(computer);
+        LOGGER.log(INFO, "StuckAgentDetector: Agent {0} channelHealth={1}", 
+                new Object[]{nodeName, channelHealth});
         
         if (channelHealth == ChannelHealth.HEALTHY) {
             // Channel is healthy, agent is not stuck
             potentiallyStuck.remove(nodeName);
-            LOGGER.log(FINE, "Agent {0} channel is healthy, not stuck", nodeName);
+            LOGGER.log(INFO, "StuckAgentDetector: Agent {0} channel is HEALTHY, not stuck", nodeName);
             return;
         }
 
         // Agent appears to be in a potentially stuck state
+        LOGGER.log(WARNING, "StuckAgentDetector: Agent {0} MATCHES stuck criteria! channelHealth={1}",
+                new Object[]{nodeName, channelHealth});
+        
         // Track it and check if it's been stuck long enough
         StuckAgentInfo info = potentiallyStuck.computeIfAbsent(nodeName,
                 k -> new StuckAgentInfo(Instant.now(), channelHealth));
@@ -192,13 +220,13 @@ public class StuckAgentDetector extends AsyncPeriodicWork {
         long stuckDurationMs = Duration.between(info.firstDetected, Instant.now()).toMillis();
         
         if (stuckDurationMs < STUCK_GRACE_PERIOD_MS) {
-            LOGGER.log(FINE, "Agent {0} potentially stuck for {1}ms, waiting for grace period ({2}ms)",
+            LOGGER.log(WARNING, "StuckAgentDetector: Agent {0} potentially stuck for {1}ms, waiting for grace period ({2}ms)",
                     new Object[]{nodeName, stuckDurationMs, STUCK_GRACE_PERIOD_MS});
             return;
         }
 
         if (info.detectionCount < MIN_DETECTION_CYCLES) {
-            LOGGER.log(FINE, "Agent {0} detected {1} times, waiting for min cycles ({2})",
+            LOGGER.log(WARNING, "StuckAgentDetector: Agent {0} detected {1} times, waiting for min cycles ({2})",
                     new Object[]{nodeName, info.detectionCount, MIN_DETECTION_CYCLES});
             return;
         }

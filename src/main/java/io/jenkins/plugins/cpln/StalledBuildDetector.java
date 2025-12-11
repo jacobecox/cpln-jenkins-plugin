@@ -107,24 +107,40 @@ public class StalledBuildDetector extends AsyncPeriodicWork {
     protected void execute(TaskListener listener) {
         Jenkins jenkins = Jenkins.getInstanceOrNull();
         if (jenkins == null) {
+            LOGGER.log(WARNING, "StalledBuildDetector: Jenkins instance is null, skipping");
             return;
         }
 
-        LOGGER.log(FINE, "Running stalled build detection...");
+        LOGGER.log(INFO, "StalledBuildDetector: Running detection cycle. Total nodes: {0}", 
+                jenkins.getNodes().size());
 
+        int cplnAgentCount = 0;
+        int checkedCount = 0;
+        
         // Process each CPLN agent
         for (Node node : jenkins.getNodes()) {
+            LOGGER.log(FINE, "StalledBuildDetector: Checking node {0}, type: {1}", 
+                    new Object[]{node.getNodeName(), node.getClass().getSimpleName()});
+            
             if (!(node instanceof Agent)) {
+                LOGGER.log(FINE, "StalledBuildDetector: Node {0} is NOT a CPLN Agent (type: {1}), skipping", 
+                        new Object[]{node.getNodeName(), node.getClass().getName()});
                 continue;
             }
+            
+            cplnAgentCount++;
 
             Agent agent = (Agent) node;
             Cloud cloud = agent.getCloud();
 
             if (cloud == null) {
+                LOGGER.log(WARNING, "StalledBuildDetector: Agent {0} has null cloud, skipping", 
+                        node.getNodeName());
                 continue;
             }
 
+            LOGGER.log(INFO, "StalledBuildDetector: Checking CPLN agent {0}", node.getNodeName());
+            checkedCount++;
             checkAgentForStalledBuilds(agent, cloud, jenkins);
         }
 
@@ -134,8 +150,8 @@ public class StalledBuildDetector extends AsyncPeriodicWork {
             return jenkins.getNode(nodeName) == null;
         });
 
-        LOGGER.log(FINE, "Stalled build detection completed. Tracking {0} potentially stalled builds.",
-                potentiallyStalled.size());
+        LOGGER.log(INFO, "StalledBuildDetector: Completed. CPLN agents: {0}, Checked: {1}, Tracking: {2}",
+                new Object[]{cplnAgentCount, checkedCount, potentiallyStalled.size()});
     }
 
     /**
