@@ -12,6 +12,7 @@ import hudson.model.TaskListener;
 import hudson.remoting.Channel;
 import hudson.remoting.VirtualChannel;
 import jenkins.model.Jenkins;
+import hudson.node_monitors.ResponseTimeMonitor;
 
 import java.io.File;
 import java.time.Duration;
@@ -84,6 +85,11 @@ public class StalledBuildDetector extends AsyncPeriodicWork {
     // If no channel activity for this long, consider it stale
     private static final long CHANNEL_STALE_THRESHOLD_MS = Long.parseLong(
             System.getProperty("cpln.stalled.channel.threshold.ms", "45000"));
+
+    // Response time threshold in milliseconds (default: 5000ms = 5 seconds)
+    // If response time exceeds this, the agent is considered degraded
+    private static final long RESPONSE_TIME_THRESHOLD_MS = Long.parseLong(
+            System.getProperty("cpln.stalled.response.time.threshold.ms", "5000"));
 
     // Track potentially stalled builds
     private final Map<String, StalledBuildInfo> potentiallyStalled = new ConcurrentHashMap<>();
@@ -172,32 +178,42 @@ public class StalledBuildDetector extends AsyncPeriodicWork {
         if (!executor.isBusy()) {
             String key = buildKey(nodeName, executor);
             potentiallyStalled.remove(key);
+            LOGGER.log(FINE, "Agent {0} executor not busy, skipping stalled build check", nodeName);
             return;
         }
 
         Queue.Executable executable = executor.getCurrentExecutable();
         if (executable == null) {
+            LOGGER.log(FINE, "Agent {0} has busy executor but no executable", nodeName);
             return;
         }
 
         String key = buildKey(nodeName, executor);
+        String buildName = getBuildName(executable);
+        
+        LOGGER.log(INFO, "Checking agent {0} for stalled build: {1}", new Object[]{nodeName, buildName});
 
         // RULE 3: Check log quiet period
         // If logs are still being written, build is still active
         long logQuietTime = getLogQuietTime(executable);
+        LOGGER.log(INFO, "Agent {0} log quiet time: {1}ms (threshold: {2}ms)",
+                new Object[]{nodeName, logQuietTime, LOG_QUIET_PERIOD_MS});
+        
         if (logQuietTime < LOG_QUIET_PERIOD_MS) {
             // Logs are recent, build is still producing output
             potentiallyStalled.remove(key);
-            LOGGER.log(FINEST, "Build on {0} has recent log output ({1}ms ago), not stalled",
+            LOGGER.log(INFO, "Agent {0} has recent log output ({1}ms ago), NOT stalled",
                     new Object[]{nodeName, logQuietTime});
             return;
         }
 
-        // RULE 4: Check channel staleness
+        // RULE 4: Check channel staleness / response time
         ChannelStatus channelStatus = assessChannelStatus(computer);
+        LOGGER.log(INFO, "Agent {0} channel status: {1}", new Object[]{nodeName, channelStatus});
+        
         if (channelStatus == ChannelStatus.HEALTHY) {
             potentiallyStalled.remove(key);
-            LOGGER.log(FINEST, "Channel for {0} is healthy, not stalled", nodeName);
+            LOGGER.log(INFO, "Agent {0} channel is HEALTHY, NOT stalled", nodeName);
             return;
         }
 
@@ -205,9 +221,12 @@ public class StalledBuildDetector extends AsyncPeriodicWork {
         // If workload crashed, other mechanisms handle cleanup
         if (!isWorkloadRunningHealthy(cloud, nodeName)) {
             potentiallyStalled.remove(key);
-            LOGGER.log(FINE, "Workload {0} is not running healthy, skipping stalled detection", nodeName);
+            LOGGER.log(INFO, "Agent {0} workload not running healthy, skipping stalled detection", nodeName);
             return;
         }
+        
+        LOGGER.log(INFO, "Agent {0} MATCHES stalled criteria: logQuiet={1}ms, channelStatus={2}",
+                new Object[]{nodeName, logQuietTime, channelStatus});
 
         // All criteria met - this build may be stalled
         StalledBuildInfo info = potentiallyStalled.computeIfAbsent(key,
@@ -286,12 +305,23 @@ public class StalledBuildDetector extends AsyncPeriodicWork {
 
     /**
      * Assess the status of the computer's remoting channel.
+     * Checks multiple indicators: response time, channel state, and activity tracking.
      */
     private ChannelStatus assessChannelStatus(hudson.model.Computer computer) {
         try {
+            // CRITICAL CHECK: Response time from Jenkins' ResponseTimeMonitor
+            // This is what Jenkins displays in the UI (e.g., "12980ms")
+            long responseTime = getResponseTime(computer);
+            if (responseTime > RESPONSE_TIME_THRESHOLD_MS) {
+                LOGGER.log(INFO, "Agent {0} has HIGH response time: {1}ms (threshold: {2}ms)",
+                        new Object[]{computer.getName(), responseTime, RESPONSE_TIME_THRESHOLD_MS});
+                return ChannelStatus.HIGH_RESPONSE_TIME;
+            }
+            
             VirtualChannel virtualChannel = computer.getChannel();
             
             if (virtualChannel == null) {
+                LOGGER.log(INFO, "Agent {0} has NO channel but appears online", computer.getName());
                 return ChannelStatus.NO_CHANNEL;
             }
 
@@ -299,15 +329,17 @@ public class StalledBuildDetector extends AsyncPeriodicWork {
                 Channel channel = (Channel) virtualChannel;
                 
                 if (channel.isClosingOrClosed()) {
+                    LOGGER.log(INFO, "Agent {0} channel is closing/closed", computer.getName());
                     return ChannelStatus.CLOSING;
                 }
 
-                // Try to get last activity time
+                // Try to get last activity time from channel
                 long lastHeard = getChannelLastHeard(channel);
                 if (lastHeard > 0) {
                     long activityAge = System.currentTimeMillis() - lastHeard;
                     if (activityAge > CHANNEL_STALE_THRESHOLD_MS) {
-                        LOGGER.log(FINE, "Channel stale: no activity for {0}ms", activityAge);
+                        LOGGER.log(INFO, "Agent {0} channel stale: no activity for {1}ms",
+                                new Object[]{computer.getName(), activityAge});
                         return ChannelStatus.STALE;
                     }
                 }
@@ -320,17 +352,40 @@ public class StalledBuildDetector extends AsyncPeriodicWork {
                 if (lastActivity > 0) {
                     long activityAge = System.currentTimeMillis() - lastActivity;
                     if (activityAge > CHANNEL_STALE_THRESHOLD_MS) {
+                        LOGGER.log(INFO, "Agent {0} CPLN activity stale: no activity for {1}ms",
+                                new Object[]{computer.getName(), activityAge});
                         return ChannelStatus.STALE;
                     }
                 }
             }
 
+            LOGGER.log(FINE, "Agent {0} channel appears healthy (response time: {1}ms)",
+                    new Object[]{computer.getName(), responseTime});
             return ChannelStatus.HEALTHY;
 
         } catch (Exception e) {
-            LOGGER.log(FINE, "Error assessing channel: {0}", e.getMessage());
-            return ChannelStatus.HEALTHY; // Assume healthy on error
+            LOGGER.log(WARNING, "Error assessing channel for {0}: {1}",
+                    new Object[]{computer.getName(), e.getMessage()});
+            return ChannelStatus.HEALTHY; // Assume healthy on error to avoid false positives
         }
+    }
+
+    /**
+     * Get the response time from Jenkins' ResponseTimeMonitor.
+     * This is the value displayed in the Jenkins UI.
+     * 
+     * @return response time in milliseconds, or -1 if unavailable
+     */
+    private long getResponseTime(hudson.model.Computer computer) {
+        try {
+            ResponseTimeMonitor.Data data = ResponseTimeMonitor.DESCRIPTOR.get(computer);
+            if (data != null) {
+                return data.getAverage();
+            }
+        } catch (Exception e) {
+            LOGGER.log(FINE, "Error getting response time: {0}", e.getMessage());
+        }
+        return -1;
     }
 
     /**
@@ -530,9 +585,15 @@ public class StalledBuildDetector extends AsyncPeriodicWork {
      * Channel status enum.
      */
     private enum ChannelStatus {
+        /** Channel is functioning normally with acceptable response time */
         HEALTHY,
+        /** No channel available for an online agent */
         NO_CHANNEL,
+        /** Channel is closing or closed */
         CLOSING,
+        /** Channel has very high response time (>5s default) */
+        HIGH_RESPONSE_TIME,
+        /** No channel activity for extended period */
         STALE
     }
 

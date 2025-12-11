@@ -9,6 +9,7 @@ import hudson.model.TaskListener;
 import jenkins.model.Jenkins;
 import hudson.remoting.Channel;
 import hudson.remoting.VirtualChannel;
+import hudson.node_monitors.ResponseTimeMonitor;
 
 import java.time.Duration;
 import java.time.Instant;
@@ -73,6 +74,11 @@ public class StuckAgentDetector extends AsyncPeriodicWork {
     // If no channel activity for this long, consider it stale
     private static final long CHANNEL_STALE_THRESHOLD_MS = Long.parseLong(
             System.getProperty("cpln.channel.stale.threshold.ms", "30000"));
+
+    // Response time threshold in milliseconds (default: 5000ms = 5 seconds)
+    // If response time exceeds this, the agent is considered degraded
+    private static final long RESPONSE_TIME_THRESHOLD_MS = Long.parseLong(
+            System.getProperty("cpln.stuck.response.time.threshold.ms", "5000"));
 
     // Track agents that may be stuck
     private final Map<String, StuckAgentInfo> potentiallyStuck = new ConcurrentHashMap<>();
@@ -228,10 +234,20 @@ public class StuckAgentDetector extends AsyncPeriodicWork {
      */
     private ChannelHealth assessChannelHealth(hudson.model.Computer computer) {
         try {
+            // CRITICAL CHECK: Response time from Jenkins' ResponseTimeMonitor
+            // This is what Jenkins displays in the UI (e.g., "12980ms")
+            long responseTime = getResponseTime(computer);
+            if (responseTime > RESPONSE_TIME_THRESHOLD_MS) {
+                LOGGER.log(INFO, "Agent {0} has HIGH response time: {1}ms (threshold: {2}ms)",
+                        new Object[]{computer.getName(), responseTime, RESPONSE_TIME_THRESHOLD_MS});
+                return ChannelHealth.HIGH_RESPONSE_TIME;
+            }
+            
             VirtualChannel virtualChannel = computer.getChannel();
             
             if (virtualChannel == null) {
                 // No channel - this is abnormal for an "online" agent
+                LOGGER.log(INFO, "Agent {0} has NO channel but appears online", computer.getName());
                 return ChannelHealth.NO_CHANNEL;
             }
 
@@ -242,6 +258,7 @@ public class StuckAgentDetector extends AsyncPeriodicWork {
                 
                 if (channel.isClosingOrClosed()) {
                     // Channel is closing but agent still appears online
+                    LOGGER.log(INFO, "Agent {0} channel is closing/closed", computer.getName());
                     return ChannelHealth.CLOSING;
                 }
 
@@ -252,7 +269,8 @@ public class StuckAgentDetector extends AsyncPeriodicWork {
                 if (lastHeartbeat > 0) {
                     long heartbeatAge = System.currentTimeMillis() - lastHeartbeat;
                     if (heartbeatAge > CHANNEL_STALE_THRESHOLD_MS) {
-                        LOGGER.log(FINE, "Channel heartbeat is stale: {0}ms old", heartbeatAge);
+                        LOGGER.log(INFO, "Agent {0} channel heartbeat is stale: {1}ms old",
+                                new Object[]{computer.getName(), heartbeatAge});
                         return ChannelHealth.STALE_HEARTBEAT;
                     }
                 }
@@ -265,24 +283,41 @@ public class StuckAgentDetector extends AsyncPeriodicWork {
                 if (lastActivity > 0) {
                     long activityAge = System.currentTimeMillis() - lastActivity;
                     if (activityAge > CHANNEL_STALE_THRESHOLD_MS) {
-                        LOGGER.log(FINE, "No channel activity for {0}ms", activityAge);
+                        LOGGER.log(INFO, "Agent {0} no channel activity for {1}ms",
+                                new Object[]{computer.getName(), activityAge});
                         return ChannelHealth.NO_ACTIVITY;
                     }
                 }
             }
 
-            // Additional check: for unique agents with no busy executors that have been
-            // online for a while, they SHOULD have been terminated by retention strategy
-            // If they haven't, something may be wrong
-            // But we can't definitively say the channel is unhealthy without more signals
-
+            LOGGER.log(FINE, "Agent {0} channel appears healthy (response time: {1}ms)",
+                    new Object[]{computer.getName(), responseTime});
             return ChannelHealth.HEALTHY;
 
         } catch (Exception e) {
-            LOGGER.log(FINE, "Error assessing channel health: {0}", e.getMessage());
+            LOGGER.log(WARNING, "Error assessing channel health for {0}: {1}",
+                    new Object[]{computer.getName(), e.getMessage()});
             // If we can't assess, assume healthy to avoid false positives
             return ChannelHealth.HEALTHY;
         }
+    }
+
+    /**
+     * Get the response time from Jenkins' ResponseTimeMonitor.
+     * This is the value displayed in the Jenkins UI.
+     * 
+     * @return response time in milliseconds, or -1 if unavailable
+     */
+    private long getResponseTime(hudson.model.Computer computer) {
+        try {
+            ResponseTimeMonitor.Data data = ResponseTimeMonitor.DESCRIPTOR.get(computer);
+            if (data != null) {
+                return data.getAverage();
+            }
+        } catch (Exception e) {
+            LOGGER.log(FINE, "Error getting response time: {0}", e.getMessage());
+        }
+        return -1;
     }
 
     /**
@@ -373,6 +408,8 @@ public class StuckAgentDetector extends AsyncPeriodicWork {
         NO_CHANNEL,
         /** Channel is closing or closed */
         CLOSING,
+        /** Response time is very high (>5s default) */
+        HIGH_RESPONSE_TIME,
         /** Heartbeat is stale */
         STALE_HEARTBEAT,
         /** No channel activity for extended period */
