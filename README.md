@@ -170,6 +170,90 @@ These mechanisms ensure workloads are cleaned up regardless of:
 - Controller restarts
 - Stalled JVMs due to CPU overload
 
+### Using Labels to Control Job Assignment
+
+The plugin uses Jenkins' standard **label-based routing** to control which jobs run on Control Plane agents. This is especially useful when you have multiple cloud providers configured (e.g., Control Plane, Kubernetes, EC2).
+
+#### How It Works
+
+1. **Cloud Labels**: Each cloud configuration has a `Labels` field where you specify one or more labels (space-separated), e.g., `cpln linux-build`
+2. **Job Restrictions**: In job configurations, you can check "Restrict where this project can be run" and enter a label expression
+3. **Allow Jobs Without Labels**: Controls whether unlabeled jobs can run on this cloud
+
+#### Multi-Cloud Configuration Example
+
+If you have multiple cloud providers:
+
+| Cloud Provider | Labels | Allow Jobs Without Labels |
+|----------------|--------|---------------------------|
+| Control Plane  | `cpln` | No |
+| Kubernetes     | `k8s` | No |
+| EC2            | `ec2` | Yes |
+
+Then job routing works as follows:
+
+| Job Label Expression | Where It Runs |
+|---------------------|---------------|
+| `cpln` | Only Control Plane cloud |
+| `k8s` | Only Kubernetes cloud |
+| `linux` | Any cloud |
+
+#### Ensuring a Job Runs Only on Control Plane
+
+1. **Configure the cloud**: Set a unique label on your Control Plane cloud (e.g., `cpln`)
+2. **Configure the job**:
+   - Go to the job configuration
+   - Check **"Restrict where this project can be run"**
+   - Enter `cpln` in the **Label Expression** field
+3. Only agents from the Control Plane cloud will pick up this job
+
+#### Ensuring a Job Never Runs on Control Plane
+
+1. Give the Control Plane cloud a unique label (e.g., `cpln`)
+2. Uncheck **"Allow Jobs Without Labels"** on the Control Plane cloud
+3. Ensure your job either:
+   - Has no label restriction (it won't match `cpln`-only cloud), or
+   - Requests a different label (e.g., `k8s` or `ec2`)
+
+#### Pipeline Example
+
+For Pipeline jobs, use the `agent` directive with a label:
+
+```groovy
+pipeline {
+    agent { label 'cpln' }
+    stages {
+        stage('Build') {
+            steps {
+                sh 'echo "Running on Control Plane agent"'
+            }
+        }
+    }
+}
+```
+
+Or for specific stages:
+
+```groovy
+pipeline {
+    agent none
+    stages {
+        stage('Build on CPLN') {
+            agent { label 'cpln' }
+            steps {
+                sh 'echo "Running on Control Plane"'
+            }
+        }
+        stage('Build on K8s') {
+            agent { label 'k8s' }
+            steps {
+                sh 'echo "Running on Kubernetes"'
+            }
+        }
+    }
+}
+```
+
 ### Notes
 
 - Authorization Requirements for the ```API Key``` in the Jenkins Cpln Cloud configuration:
